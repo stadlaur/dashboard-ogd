@@ -16,6 +16,18 @@ def _s(x) -> str:
         return ""
     return str(x).strip().lower()
 
+import pandas as pd  # muss im File sowieso schon da sein; falls doppelt: ok
+
+def _s(x) -> str:
+    """Convert possibly-NaN values to lowercase string safely."""
+    try:
+        # pandas NA / NaN
+        if pd.isna(x):
+            return ""
+    except Exception:
+        pass
+    return str(x).strip().lower()
+
 def score_distribution(meta: dict) -> int:
     fmt = _s(meta.get("format"))
     media = _s(meta.get("mediaType"))
@@ -24,7 +36,6 @@ def score_distribution(meta: dict) -> int:
 
     u = " ".join([fmt, media, access, download])
 
-    # 5: API / Services
     api_tokens = [
         "api", "odata", "sparql", "wfs", "wms",
         "arcgis/rest", "service=wfs", "service=wms", "/rest", "rest/"
@@ -32,19 +43,15 @@ def score_distribution(meta: dict) -> int:
     if any(t in u for t in api_tokens):
         return 5
 
-    # 4: Linked Data
     if any(t in u for t in ["rdf", "turtle", "ttl", "json-ld", "n-triples"]):
         return 4
 
-    # 3: JSON / XML / GeoJSON
     if any(t in u for t in ["geojson", "json", "application/json", "xml"]):
         return 3
 
-    # 2: CSV
     if "csv" in u or "text/csv" in u:
         return 2
 
-    # 1: Excel / Office
     if any(t in u for t in ["xls", "xlsx", "excel", "spreadsheetml"]):
         return 1
 
