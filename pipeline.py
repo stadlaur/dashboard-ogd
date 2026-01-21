@@ -10,18 +10,24 @@ OUTDIR.mkdir(exist_ok=True)
 def parse_dt(s):
     return pd.to_datetime(s, errors="coerce")
 
+def _s(x) -> str:
+    """Convert possibly-NaN values to lowercase string safely."""
+    if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
+        return ""
+    return str(x).strip().lower()
+
 def score_distribution(meta: dict) -> int:
-    fmt = (meta.get("format") or "").lower()
-    media = (meta.get("mediaType") or "").lower()
-    access = (meta.get("accessUrl") or "").lower()
-    download = (meta.get("downloadUrl") or "").lower()
+    fmt = _s(meta.get("format"))
+    media = _s(meta.get("mediaType"))
+    access = _s(meta.get("accessUrl"))
+    download = _s(meta.get("downloadUrl"))
 
     u = " ".join([fmt, media, access, download])
 
     # 5: API / Services
     api_tokens = [
         "api", "odata", "sparql", "wfs", "wms",
-        "arcgis/rest", "service=wfs", "service=wms", "rest"
+        "arcgis/rest", "service=wfs", "service=wms", "/rest", "rest/"
     ]
     if any(t in u for t in api_tokens):
         return 5
@@ -42,7 +48,6 @@ def score_distribution(meta: dict) -> int:
     if any(t in u for t in ["xls", "xlsx", "excel", "spreadsheetml"]):
         return 1
 
-    # Default: treat as machine-readable table
     return 2
 
 
