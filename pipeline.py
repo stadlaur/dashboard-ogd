@@ -11,21 +11,14 @@ def parse_dt(s):
     return pd.to_datetime(s, errors="coerce")
 
 def _s(x) -> str:
-    """Convert possibly-NaN values to lowercase string safely."""
-    if x is None or (isinstance(x, float) and pd.isna(x)) or pd.isna(x):
-        return ""
-    return str(x).strip().lower()
-
-import pandas as pd  # muss im File sowieso schon da sein; falls doppelt: ok
-
-def _s(x) -> str:
-    """Convert possibly-NaN values to lowercase string safely."""
+    """Convert possibly-missing values (NaN/None/etc.) to lowercase string safely."""
     try:
-        # pandas NA / NaN
         if pd.isna(x):
             return ""
     except Exception:
         pass
+    if x is None:
+        return ""
     return str(x).strip().lower()
 
 def score_distribution(meta: dict) -> int:
@@ -36,6 +29,7 @@ def score_distribution(meta: dict) -> int:
 
     u = " ".join([fmt, media, access, download])
 
+    # 5: API / Services
     api_tokens = [
         "api", "odata", "sparql", "wfs", "wms",
         "arcgis/rest", "service=wfs", "service=wms", "/rest", "rest/"
@@ -43,18 +37,23 @@ def score_distribution(meta: dict) -> int:
     if any(t in u for t in api_tokens):
         return 5
 
+    # 4: Linked Data
     if any(t in u for t in ["rdf", "turtle", "ttl", "json-ld", "n-triples"]):
         return 4
 
+    # 3: JSON / XML / GeoJSON
     if any(t in u for t in ["geojson", "json", "application/json", "xml"]):
         return 3
 
+    # 2: CSV
     if "csv" in u or "text/csv" in u:
         return 2
 
+    # 1: Excel / Office
     if any(t in u for t in ["xls", "xlsx", "excel", "spreadsheetml"]):
         return 1
 
+    # Default
     return 2
 
 
@@ -62,11 +61,14 @@ def main():
     print("Loading metadata from:", URL)
     raw = requests.get(URL, timeout=60).json()
 
-    ds = pd.json_normalize(raw["dataset"])
+    # Expect DCAT-like structure with top-level "dataset"
+    ds = pd.json_normalize(raw.get("dataset", []))
+    if ds.empty:
+        raise RuntimeError("No datasets found in zhweb.json (raw['dataset'] missing or empty).")
 
     # --- Dates ---
-    ds["issued_dt"] = ds["issued"].apply(parse_dt)
-    ds["modified_dt"] = ds["modified"].apply(parse_dt)
+    ds["issued_dt"] = ds.get("issued", pd.Series(dtype="object")).apply(parse_dt)
+    ds["modified_dt"] = ds.get("modified", pd.Series(dtype="object")).apply(parse_dt)
 
     now = datetime.now(timezone.utc)
     cutoff = pd.Timestamp(now - timedelta(days=365)).tz_convert(None)
@@ -74,13 +76,17 @@ def main():
     # ======================================================
     # Keyword metrics
     # ======================================================
-    kw = ds[["identifier", "keyword", "issued_dt", "modified_dt"]].explode("keyword")
+    # Ensure keyword column exists
+    if "keyword" not in ds.columns:
+        ds["keyword"] = None
 
+    kw = ds[["identifier", "keyword", "issued_dt", "modified_dt"]].explode("keyword")
     kw["is_new_12m"] = kw["issued_dt"] >= cutoff
     kw["is_upd_12m"] = kw["modified_dt"] >= cutoff
 
     kw_metrics = (
-        kw.groupby("keyword", dropna=True)
+        kw.dropna(subset=["keyword"])
+          .groupby("keyword")
           .agg(
               datasets_total=("identifier", "nunique"),
               datasets_new_12m=("is_new_12m", "sum"),
@@ -89,20 +95,28 @@ def main():
           .reset_index()
           .sort_values("datasets_total", ascending=False)
     )
-
     kw_metrics.to_parquet(OUTDIR / "kw_metrics.parquet", index=False)
 
     # ======================================================
     # Publisher maturity (5-star)
     # ======================================================
+    if "publisher" not in ds.columns:
+        ds["publisher"] = None
+
     pub = ds[["identifier", "publisher"]].explode("publisher")
 
+    if "distribution" not in ds.columns:
+        ds["distribution"] = None
+
     dist = ds[["identifier", "distribution"]].explode("distribution")
-    dist_norm = pd.json_normalize(dist["distribution"]).add_prefix("dist_")
-    dist_rows = pd.concat(
-        [dist[["identifier"]].reset_index(drop=True), dist_norm],
-        axis=1
-    )
+
+    # Normalize distributions; if empty, create empty columns
+    dist_norm = pd.json_normalize(dist["distribution"]).add_prefix("dist_") if not dist.empty else pd.DataFrame()
+    dist_rows = pd.concat([dist[["identifier"]].reset_index(drop=True), dist_norm.reset_index(drop=True)], axis=1)
+
+    for col in ["dist_format", "dist_mediaType", "dist_accessUrl", "dist_downloadUrl"]:
+        if col not in dist_rows.columns:
+            dist_rows[col] = None
 
     dist_rows["dist_score"] = dist_rows.apply(
         lambda r: score_distribution({
@@ -114,11 +128,11 @@ def main():
         axis=1
     )
 
-    # Best score per dataset
+    # Best score per dataset (if there are no distributions, fall back to NaN -> fill 2)
     ds_best = (
-        dist_rows.groupby("identifier")["dist_score"]
-        .max()
-        .reset_index(name="dataset_best_score")
+        dist_rows.groupby("identifier")["dist_score"].max().reset_index(name="dataset_best_score")
+        if not dist_rows.empty
+        else ds[["identifier"]].drop_duplicates().assign(dataset_best_score=2)
     )
 
     pub_scores = (
@@ -132,7 +146,6 @@ def main():
            .reset_index()
            .sort_values(["avg_score", "datasets"], ascending=False)
     )
-
     pub_scores.to_parquet(OUTDIR / "publisher_scores.parquet", index=False)
 
     pub_score_dist = (
@@ -141,23 +154,22 @@ def main():
            .nunique()
            .reset_index(name="datasets")
     )
-
     pub_score_dist.to_parquet(OUTDIR / "publisher_score_dist.parquet", index=False)
 
     # ======================================================
-    # Metadata snapshot (for KPIs)
+    # KPIs
     # ======================================================
     kpis = {
-        "datasets_total": int(ds["identifier"].nunique()),
+        "datasets_total": int(ds["identifier"].nunique()) if "identifier" in ds.columns else 0,
         "publishers_total": int(pub["publisher"].nunique()),
         "keywords_total": int(kw["keyword"].nunique()),
         "last_modified_max": str(ds["modified_dt"].max()),
         "run_timestamp": str(now),
     }
-
     pd.DataFrame([kpis]).to_parquet(OUTDIR / "kpis.parquet", index=False)
 
     print("Pipeline finished. Files written to data/")
 
 if __name__ == "__main__":
     main()
+
